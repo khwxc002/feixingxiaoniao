@@ -9,6 +9,7 @@
 #include "mcp_server.h"
 #include "assets.h"
 #include "settings.h"
+#include "motor_controller.h"
 
 #include <cstring>
 #include <esp_log.h>
@@ -155,11 +156,46 @@ void Application::Initialize() {
         }
     });
 
+    // Initialize the motor controller for voice-controlled dual motor outputs
+    motor_controller_.Initialize();
+
     // Start network asynchronously
     board.StartNetwork();
 
     // Update the status bar immediately to show the network state
     display->UpdateStatusBar(true);
+}
+
+bool Application::HandleVoiceMotorCommand(const std::string& text) {
+    std::string normalized = text;
+    auto display = Board::GetInstance().GetDisplay();
+
+    if (normalized.find("前进") != std::string::npos) {
+        motor_controller_.Forward();
+        display->SetChatMessage("system", "已执行：前进");
+        return true;
+    }
+    if (normalized.find("后退") != std::string::npos) {
+        motor_controller_.Backward();
+        display->SetChatMessage("system", "已执行：后退");
+        return true;
+    }
+    if (normalized.find("左转") != std::string::npos) {
+        motor_controller_.Left();
+        display->SetChatMessage("system", "已执行：左转");
+        return true;
+    }
+    if (normalized.find("右转") != std::string::npos) {
+        motor_controller_.Right();
+        display->SetChatMessage("system", "已执行：右转");
+        return true;
+    }
+    if (normalized.find("停止") != std::string::npos) {
+        motor_controller_.Stop();
+        display->SetChatMessage("system", "已执行：停止");
+        return true;
+    }
+    return false;
 }
 
 void Application::Run() {
@@ -550,9 +586,15 @@ void Application::InitializeProtocol() {
         } else if (strcmp(type->valuestring, "stt") == 0) {
             auto text = cJSON_GetObjectItem(root, "text");
             if (cJSON_IsString(text)) {
-                ESP_LOGI(TAG, ">> %s", text->valuestring);
-                Schedule([display, message = std::string(text->valuestring)]() {
+                std::string text_str = text->valuestring;
+                ESP_LOGI(TAG, ">> %s", text_str.c_str());
+                Schedule([display, message = std::string(text_str)]() {
                     display->SetChatMessage("user", message.c_str());
+                });
+                Schedule([this, text = std::move(text_str)]() {
+                    if (HandleVoiceMotorCommand(text)) {
+                        ESP_LOGI(TAG, "Voice motor command executed: %s", text.c_str());
+                    }
                 });
             }
         } else if (strcmp(type->valuestring, "llm") == 0) {

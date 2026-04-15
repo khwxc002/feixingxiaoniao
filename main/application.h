@@ -14,6 +14,7 @@
 #include "protocol.h"
 #include "ota.h"
 #include "audio_service.h"
+#include "motor_controller.h"
 #include "device_state.h"
 #include "device_state_machine.h"
 
@@ -166,9 +167,12 @@ private:
     void ShowActivationCode(const std::string& code, const std::string& message);
     void SetListeningMode(ListeningMode mode);
     ListeningMode GetDefaultListeningMode() const;
+    bool HandleVoiceMotorCommand(const std::string& text);
     
     // State change handler called by state machine
     void OnStateChanged(DeviceState old_state, DeviceState new_state);
+
+    MotorController motor_controller_;
 };
 
 
