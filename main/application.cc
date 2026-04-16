@@ -60,6 +60,12 @@ bool Application::SetDeviceState(DeviceState state) {
 }
 
 void Application::Initialize() {
+    // Add state change listeners before entering the first state,
+    // so the initial state is handled by the LED/display logic.
+    state_machine_.AddStateChangeListener([this](DeviceState old_state, DeviceState new_state) {
+        xEventGroupSetBits(event_group_, MAIN_EVENT_STATE_CHANGED);
+    });
+
     auto& board = Board::GetInstance();
     SetDeviceState(kDeviceStateStarting);
 
@@ -85,11 +91,6 @@ void Application::Initialize() {
         xEventGroupSetBits(event_group_, MAIN_EVENT_VAD_CHANGE);
     };
     audio_service_.SetCallbacks(callbacks);
-
-    // Add state change listeners
-    state_machine_.AddStateChangeListener([this](DeviceState old_state, DeviceState new_state) {
-        xEventGroupSetBits(event_group_, MAIN_EVENT_STATE_CHANGED);
-    });
 
     // Start the clock timer to update the status bar
     esp_timer_start_periodic(clock_timer_handle_, 1000000);
