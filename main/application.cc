@@ -10,8 +10,11 @@
 #include "assets.h"
 #include "settings.h"
 #include "motor_controller.h"
+#include "servo_controller.h"
 
+#include <algorithm>
 #include <cstring>
+#include <cstdio>
 #include <esp_log.h>
 #include <cJSON.h>
 #include <driver/gpio.h>
@@ -160,6 +163,29 @@ void Application::Initialize() {
     // Initialize the motor controller for voice-controlled dual motor outputs
     motor_controller_.Initialize();
 
+    // Initialize servo controller
+    if (servo_controller_.Initialize(board.GetI2cBus()) == ESP_OK) {
+        // Add default servo configuration
+        ServoController::ServoConfig servo_config = {
+            .channel = 0,
+            .name = "main_servo",
+            .min_angle = 0,
+            .max_angle = 180,
+            .default_angle = 90,
+            .min_pulse_us = 500,
+            .max_pulse_us = 2500
+        };
+        servo_controller_.AddServo(servo_config);
+
+        // Set voice command callback
+        servo_controller_.SetVoiceCommandCallback([this](const std::string& command, int angle) {
+            auto display = Board::GetInstance().GetDisplay();
+            char msg[64];
+            snprintf(msg, sizeof(msg), "舵机已设置为 %d 度", angle);
+            display->SetChatMessage("system", msg);
+        });
+    }
+
     // Start network asynchronously
     board.StartNetwork();
 
@@ -197,6 +223,10 @@ bool Application::HandleVoiceMotorCommand(const std::string& text) {
         return true;
     }
     return false;
+}
+
+bool Application::HandleVoiceServoCommand(const std::string& text) {
+    return servo_controller_.ProcessVoiceCommand(text);
 }
 
 void Application::Run() {
@@ -595,6 +625,8 @@ void Application::InitializeProtocol() {
                 Schedule([this, text = std::move(text_str)]() {
                     if (HandleVoiceMotorCommand(text)) {
                         ESP_LOGI(TAG, "Voice motor command executed: %s", text.c_str());
+                    } else if (HandleVoiceServoCommand(text)) {
+                        ESP_LOGI(TAG, "Voice servo command executed: %s", text.c_str());
                     }
                 });
             }

@@ -365,7 +365,9 @@ public:
         return &backlight;
     }
 
-    virtual bool GetBatteryLevel(int& level, bool& charging, bool& discharging) override {
+    virtual i2c_master_bus_handle_t GetI2cBus() override {
+        return i2c_bus_;
+    }
         static bool last_discharging = false;
         charging = power_manager_->IsCharging();
         discharging = power_manager_->IsDischarging();

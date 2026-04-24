@@ -8,6 +8,7 @@
 #include <string>
 #include <functional>
 #include <network_interface.h>
+#include <driver/i2c_master.h>
 
 #include "led/led.h"
 #include "backlight.h"
@@ -79,9 +80,10 @@ public:
     virtual const char* GetNetworkStateIcon() = 0;
     virtual bool GetBatteryLevel(int &level, bool& charging, bool& discharging);
     virtual std::string GetSystemInfoJson();
+    virtual std::string GetDeviceStatusJson() = 0;
     virtual void SetPowerSaveLevel(PowerSaveLevel level) = 0;
     virtual std::string GetBoardJson() = 0;
-    virtual std::string GetDeviceStatusJson() = 0;
+    virtual i2c_master_bus_handle_t GetI2cBus() { return nullptr; }
 };
 
 #define DECLARE_BOARD(BOARD_CLASS_NAME) \
