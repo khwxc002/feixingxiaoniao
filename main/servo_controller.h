@@ -6,6 +6,7 @@
 #include <string>
 #include <functional>
 #include <vector>
+#include <chrono>  // 【新增】用于时间戳记录
 
 class ServoController {
 public:
@@ -58,8 +59,11 @@ private:
     static constexpr uint8_t kMode2 = 0x01;
     static constexpr uint8_t kPwmBase = 0x06;
     static constexpr uint8_t kPrescale = 0xFE;
-    static constexpr int kPwmFreqHz = 50;
     static constexpr int kOscillatorHz = 25000000;
+    static constexpr int kPwmFreqHz = 50;
+    
+    // 【新增】指令去重控制
+    static constexpr int kMinCommandIntervalMs = 1000;  // 最小命令间隔1秒
 
     i2c_master_bus_handle_t i2c_bus_;
     i2c_master_dev_handle_t pca9685_handle_;
@@ -67,6 +71,10 @@ private:
     std::vector<ServoConfig> servos_;
     std::vector<int> current_angles_;
     VoiceCommandCallback voice_callback_;
+    
+    // 【新增】去重相关成员变量
+    std::string last_command_;           // 上次执行的命令
+    std::chrono::steady_clock::time_point last_command_time_;  // 上次执行时间
 
     // 私有方法
     esp_err_t WriteRegister(uint8_t reg, uint8_t value);

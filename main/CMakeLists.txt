@@ -34,6 +34,7 @@ set(SOURCES "audio/audio_codec.cc"
             "application.cc"
             "motor_controller.cc"
             "servo_controller.cc"
+           
             "ota.cc"
             "settings.cc"
             "device_state_machine.cc"

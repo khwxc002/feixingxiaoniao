@@ -1,28 +1,28 @@
 #include "application.h"
+#include "assets.h"
+#include "assets/lang_config.h"
+#include "audio_codec.h"
 #include "board.h"
 #include "display.h"
-#include "system_info.h"
-#include "audio_codec.h"
-#include "mqtt_protocol.h"
-#include "websocket_protocol.h"
-#include "assets/lang_config.h"
+#include "driver/i2c_master.h"
 #include "mcp_server.h"
-#include "assets.h"
-#include "settings.h"
 #include "motor_controller.h"
+#include "mqtt_protocol.h"
 #include "servo_controller.h"
+#include "settings.h"
+#include "system_info.h"
+#include "websocket_protocol.h"
 
-#include <algorithm>
-#include <cstring>
-#include <cstdio>
-#include <esp_log.h>
-#include <cJSON.h>
 #include <driver/gpio.h>
+#include <esp_log.h>
 #include <arpa/inet.h>
+#include <cJSON.h>
 #include <font_awesome.h>
+#include <algorithm>
+#include <cstdio>
+#include <cstring>
 
 #define TAG "Application"
-
 
 Application::Application() {
     event_group_ = xEventGroupCreate();
@@ -37,16 +37,16 @@ Application::Application() {
     aec_mode_ = kAecOff;
 #endif
 
-    esp_timer_create_args_t clock_timer_args = {
-        .callback = [](void* arg) {
-            Application* app = (Application*)arg;
-            xEventGroupSetBits(app->event_group_, MAIN_EVENT_CLOCK_TICK);
-        },
-        .arg = this,
-        .dispatch_method = ESP_TIMER_TASK,
-        .name = "clock_timer",
-        .skip_unhandled_events = true
-    };
+    esp_timer_create_args_t clock_timer_args = {.callback =
+                                                    [](void* arg) {
+                                                        Application* app = (Application*)arg;
+                                                        xEventGroupSetBits(app->event_group_,
+                                                                           MAIN_EVENT_CLOCK_TICK);
+                                                    },
+                                                .arg = this,
+                                                .dispatch_method = ESP_TIMER_TASK,
+                                                .name = "clock_timer",
+                                                .skip_unhandled_events = true};
     esp_timer_create(&clock_timer_args, &clock_timer_handle_);
 }
 
@@ -58,13 +58,10 @@ Application::~Application() {
     vEventGroupDelete(event_group_);
 }
 
-bool Application::SetDeviceState(DeviceState state) {
-    return state_machine_.TransitionTo(state);
-}
+bool Application::SetDeviceState(DeviceState state) { return state_machine_.TransitionTo(state); }
 
 void Application::Initialize() {
-    // Add state change listeners before entering the first state,
-    // so the initial state is handled by the LED/display logic.
+    // 1. 状态机监听器
     state_machine_.AddStateChangeListener([this](DeviceState old_state, DeviceState new_state) {
         xEventGroupSetBits(event_group_, MAIN_EVENT_STATE_CHANGED);
     });
@@ -72,13 +69,13 @@ void Application::Initialize() {
     auto& board = Board::GetInstance();
     SetDeviceState(kDeviceStateStarting);
 
-    // Setup the display
+    // 2. 显示屏初始化
     auto display = board.GetDisplay();
     display->SetupUI();
     // Print board name/version info
     display->SetChatMessage("system", SystemInfo::GetUserAgent().c_str());
 
-    // Setup the audio service
+    // 4. 音频服务初始化（保持不变）
     auto codec = board.GetAudioCodec();
     audio_service_.Initialize(codec);
     audio_service_.Start();
@@ -90,12 +87,36 @@ void Application::Initialize() {
     callbacks.on_wake_word_detected = [this](const std::string& wake_word) {
         xEventGroupSetBits(event_group_, MAIN_EVENT_WAKE_WORD_DETECTED);
     };
+    // 修改VAD回调，直接处理语音命令
     callbacks.on_vad_change = [this](bool speaking) {
-        xEventGroupSetBits(event_group_, MAIN_EVENT_VAD_CHANGE);
+        // 当用户停止说话时，尝试从音频服务获取本地识别结果
+        if (!speaking) {
+            // 【优化】暂时禁用本地语音命令处理，等待真实ASR集成
+            // 如需启用，请取消下方注释并确保AudioService提供GetLastRecognizedText接口
+            /*
+            std::string last_text = audio_service_.GetLastRecognizedText();
+            
+            if (!last_text.empty()) {
+                ESP_LOGI(TAG, "Local voice command: %s", last_text.c_str());
+                
+                // 先处理电机指令
+                if (HandleVoiceMotorCommand(last_text)) {
+                    return;
+                }
+                
+                // 再处理舵机指令
+                if (HandleVoiceServoCommand(last_text)) {
+                    return;
+                }
+            }
+            */
+        } else {
+            xEventGroupSetBits(event_group_, MAIN_EVENT_VAD_CHANGE);
+        }
     };
     audio_service_.SetCallbacks(callbacks);
 
-    // Start the clock timer to update the status bar
+    // 5. 时钟定时器、MCP 工具（保持不变）
     esp_timer_start_periodic(clock_timer_handle_, 1000000);
 
     // Add MCP common tools (only once during initialization)
@@ -103,10 +124,10 @@ void Application::Initialize() {
     mcp_server.AddCommonTools();
     mcp_server.AddUserOnlyTools();
 
-    // Set network event callback for UI updates and network state handling
+    // 6. 网络事件回调（保持不变）
     board.SetNetworkEventCallback([this](NetworkEvent event, const std::string& data) {
         auto display = Board::GetInstance().GetDisplay();
-        
+
         switch (event) {
             case NetworkEvent::Scanning:
                 display->ShowNotification(Lang::Strings::SCANNING_WIFI, 30000);
@@ -146,13 +167,16 @@ void Application::Initialize() {
                 display->SetStatus(Lang::Strings::DETECTING_MODULE);
                 break;
             case NetworkEvent::ModemErrorNoSim:
-                Alert(Lang::Strings::ERROR, Lang::Strings::PIN_ERROR, "triangle_exclamation", Lang::Sounds::OGG_ERR_PIN);
+                Alert(Lang::Strings::ERROR, Lang::Strings::PIN_ERROR, "triangle_exclamation",
+                      Lang::Sounds::OGG_ERR_PIN);
                 break;
             case NetworkEvent::ModemErrorRegDenied:
-                Alert(Lang::Strings::ERROR, Lang::Strings::REG_ERROR, "triangle_exclamation", Lang::Sounds::OGG_ERR_REG);
+                Alert(Lang::Strings::ERROR, Lang::Strings::REG_ERROR, "triangle_exclamation",
+                      Lang::Sounds::OGG_ERR_REG);
                 break;
             case NetworkEvent::ModemErrorInitFailed:
-                Alert(Lang::Strings::ERROR, Lang::Strings::MODEM_INIT_ERROR, "triangle_exclamation", Lang::Sounds::OGG_EXCLAMATION);
+                Alert(Lang::Strings::ERROR, Lang::Strings::MODEM_INIT_ERROR, "triangle_exclamation",
+                      Lang::Sounds::OGG_EXCLAMATION);
                 break;
             case NetworkEvent::ModemErrorTimeout:
                 display->SetStatus(Lang::Strings::REGISTERING_NETWORK);
@@ -160,36 +184,55 @@ void Application::Initialize() {
         }
     });
 
-    // Initialize the motor controller for voice-controlled dual motor outputs
+    // 7. 电机控制器初始化（保持不变）
     motor_controller_.Initialize();
 
-    // Initialize servo controller
-    if (servo_controller_.Initialize(board.GetI2cBus()) == ESP_OK) {
-        // Add default servo configuration
-        ServoController::ServoConfig servo_config = {
-            .channel = 0,
-            .name = "main_servo",
-            .min_angle = 0,
-            .max_angle = 180,
-            .default_angle = 90,
-            .min_pulse_us = 500,
-            .max_pulse_us = 2500
-        };
-        servo_controller_.AddServo(servo_config);
-
-        // Set voice command callback
-        servo_controller_.SetVoiceCommandCallback([this](const std::string& command, int angle) {
-            auto display = Board::GetInstance().GetDisplay();
-            char msg[64];
-            snprintf(msg, sizeof(msg), "舵机已设置为 %d 度", angle);
-            display->SetChatMessage("system", msg);
-        });
+    // ========== 舵机初始化开始 ==========
+    // 直接通过ESP32-S3 I2C总线1初始化舵机控制器 (GPIO 21=SDA, GPIO 20=SCL)
+    ESP_LOGI(TAG, "Initializing servo controller on I2C bus 1...");
+    
+    // 创建I2C总线配置
+    i2c_master_bus_handle_t i2c_bus = nullptr;
+    i2c_master_bus_config_t i2c_bus_cfg = {};
+    i2c_bus_cfg.clk_source = I2C_CLK_SRC_DEFAULT;
+    i2c_bus_cfg.i2c_port = 1;  // 使用I2C总线1
+    i2c_bus_cfg.sda_io_num = GPIO_NUM_21;  // SDA引脚
+    i2c_bus_cfg.scl_io_num = GPIO_NUM_20;  // SCL引脚
+    i2c_bus_cfg.glitch_ignore_cnt = 7;
+    i2c_bus_cfg.flags.enable_internal_pullup = true;
+    
+    esp_err_t i2c_err = i2c_new_master_bus(&i2c_bus_cfg, &i2c_bus);
+    if (i2c_err == ESP_OK && i2c_bus != nullptr) {
+        esp_err_t servo_err = servo_controller_.Initialize(i2c_bus);
+        if (servo_err == ESP_OK) {
+            ESP_LOGI(TAG, "✅ 舵机控制器初始化成功！");
+            
+            // 添加默认舵机配置
+            ServoController::ServoConfig servo_config = {
+                .channel = 0,
+                .name = "duoji1",
+                .min_angle = 0,
+                .max_angle = 180,
+                .default_angle = 90,
+                .min_pulse_us = 500,
+                .max_pulse_us = 2500
+            };
+            servo_controller_.AddServo(servo_config);
+            ESP_LOGI(TAG, "✅ 0号舵机注册完成！");
+            
+        } else {
+            ESP_LOGE(TAG, "❌ 舵机控制器初始化失败！错误码: %s", esp_err_to_name(servo_err));
+            i2c_del_master_bus(i2c_bus);
+        }
+    } else {
+        ESP_LOGE(TAG, "❌ I2C总线创建失败！错误码: %s", esp_err_to_name(i2c_err));
     }
+    // ========== 舵机初始化结束 ==========
 
     // Start network asynchronously
     board.StartNetwork();
 
-    // Update the status bar immediately to show the network state
+    // 10. 更新状态栏
     display->UpdateStatusBar(true);
 }
 
@@ -226,6 +269,7 @@ bool Application::HandleVoiceMotorCommand(const std::string& text) {
 }
 
 bool Application::HandleVoiceServoCommand(const std::string& text) {
+    // 直接调用舵机控制器的语音命令处理
     return servo_controller_.ProcessVoiceCommand(text);
 }
 
@@ -233,19 +277,11 @@ void Application::Run() {
     // Set the priority of the main task to 10
     vTaskPrioritySet(nullptr, 10);
 
-    const EventBits_t ALL_EVENTS = 
-        MAIN_EVENT_SCHEDULE |
-        MAIN_EVENT_SEND_AUDIO |
-        MAIN_EVENT_WAKE_WORD_DETECTED |
-        MAIN_EVENT_VAD_CHANGE |
-        MAIN_EVENT_CLOCK_TICK |
-        MAIN_EVENT_ERROR |
-        MAIN_EVENT_NETWORK_CONNECTED |
-        MAIN_EVENT_NETWORK_DISCONNECTED |
-        MAIN_EVENT_TOGGLE_CHAT |
-        MAIN_EVENT_START_LISTENING |
-        MAIN_EVENT_STOP_LISTENING |
-        MAIN_EVENT_ACTIVATION_DONE |
+    const EventBits_t ALL_EVENTS =
+        MAIN_EVENT_SCHEDULE | MAIN_EVENT_SEND_AUDIO | MAIN_EVENT_WAKE_WORD_DETECTED |
+        MAIN_EVENT_VAD_CHANGE | MAIN_EVENT_CLOCK_TICK | MAIN_EVENT_ERROR |
+        MAIN_EVENT_NETWORK_CONNECTED | MAIN_EVENT_NETWORK_DISCONNECTED | MAIN_EVENT_TOGGLE_CHAT |
+        MAIN_EVENT_START_LISTENING | MAIN_EVENT_STOP_LISTENING | MAIN_EVENT_ACTIVATION_DONE |
         MAIN_EVENT_STATE_CHANGED;
 
     while (true) {
@@ -253,7 +289,8 @@ void Application::Run() {
 
         if (bits & MAIN_EVENT_ERROR) {
             SetDeviceState(kDeviceStateIdle);
-            Alert(Lang::Strings::ERROR, last_error_message_.c_str(), "circle_xmark", Lang::Sounds::OGG_EXCLAMATION);
+            Alert(Lang::Strings::ERROR, last_error_message_.c_str(), "circle_xmark",
+                  Lang::Sounds::OGG_EXCLAMATION);
         }
 
         if (bits & MAIN_EVENT_NETWORK_CONNECTED) {
@@ -316,7 +353,7 @@ void Application::Run() {
             clock_ticks_++;
             auto display = Board::GetInstance().GetDisplay();
             display->UpdateStatusBar();
-        
+
             // Print debug info every 10 seconds
             if (clock_ticks_ % 10 == 0) {
                 SystemInfo::PrintHeapStats();
@@ -337,12 +374,14 @@ void Application::HandleNetworkConnectedEvent() {
             return;
         }
 
-        xTaskCreate([](void* arg) {
-            Application* app = static_cast<Application*>(arg);
-            app->ActivationTask();
-            app->activation_task_handle_ = nullptr;
-            vTaskDelete(NULL);
-        }, "activation", 4096 * 2, this, 2, &activation_task_handle_);
+        xTaskCreate(
+            [](void* arg) {
+                Application* app = static_cast<Application*>(arg);
+                app->ActivationTask();
+                app->activation_task_handle_ = nullptr;
+                vTaskDelete(NULL);
+            },
+            "activation", 4096 * 2, this, 2, &activation_task_handle_);
     }
 
     // Update the status bar immediately to show the network state
@@ -353,7 +392,8 @@ void Application::HandleNetworkConnectedEvent() {
 void Application::HandleNetworkDisconnectedEvent() {
     // Close current conversation when network disconnected
     auto state = GetDeviceState();
-    if (state == kDeviceStateConnecting || state == kDeviceStateListening || state == kDeviceStateSpeaking) {
+    if (state == kDeviceStateConnecting || state == kDeviceStateListening ||
+        state == kDeviceStateSpeaking) {
         ESP_LOGI(TAG, "Closing audio channel due to network disconnection");
         protocol_->CloseAudioChannel();
     }
@@ -419,7 +459,7 @@ void Application::CheckAssetsVersion() {
         ESP_LOGW(TAG, "Assets partition is disabled for board %s", BOARD_NAME);
         return;
     }
-    
+
     Settings settings("assets", true);
     // Check if there is a new assets need to be downloaded
     std::string download_url = settings.GetString("download_url");
@@ -429,27 +469,30 @@ void Application::CheckAssetsVersion() {
 
         char message[256];
         snprintf(message, sizeof(message), Lang::Strings::FOUND_NEW_ASSETS, download_url.c_str());
-        Alert(Lang::Strings::LOADING_ASSETS, message, "cloud_arrow_down", Lang::Sounds::OGG_UPGRADE);
-        
+        Alert(Lang::Strings::LOADING_ASSETS, message, "cloud_arrow_down",
+              Lang::Sounds::OGG_UPGRADE);
+
         // Wait for the audio service to be idle for 3 seconds
         vTaskDelay(pdMS_TO_TICKS(3000));
         SetDeviceState(kDeviceStateUpgrading);
         board.SetPowerSaveLevel(PowerSaveLevel::PERFORMANCE);
         display->SetChatMessage("system", Lang::Strings::PLEASE_WAIT);
 
-        bool success = assets.Download(download_url, [this, display](int progress, size_t speed) -> void {
-            char buffer[32];
-            snprintf(buffer, sizeof(buffer), "%d%% %uKB/s", progress, speed / 1024);
-            Schedule([display, message = std::string(buffer)]() {
-                display->SetChatMessage("system", message.c_str());
+        bool success =
+            assets.Download(download_url, [this, display](int progress, size_t speed) -> void {
+                char buffer[32];
+                snprintf(buffer, sizeof(buffer), "%d%% %uKB/s", progress, speed / 1024);
+                Schedule([display, message = std::string(buffer)]() {
+                    display->SetChatMessage("system", message.c_str());
+                });
             });
-        });
 
         board.SetPowerSaveLevel(PowerSaveLevel::LOW_POWER);
         vTaskDelay(pdMS_TO_TICKS(1000));
 
         if (!success) {
-            Alert(Lang::Strings::ERROR, Lang::Strings::DOWNLOAD_ASSETS_FAILED, "circle_xmark", Lang::Sounds::OGG_EXCLAMATION);
+            Alert(Lang::Strings::ERROR, Lang::Strings::DOWNLOAD_ASSETS_FAILED, "circle_xmark",
+                  Lang::Sounds::OGG_EXCLAMATION);
             vTaskDelay(pdMS_TO_TICKS(2000));
             SetDeviceState(kDeviceStateActivating);
             return;
@@ -465,7 +508,7 @@ void Application::CheckAssetsVersion() {
 void Application::CheckNewVersion() {
     const int MAX_RETRY = 10;
     int retry_count = 0;
-    int retry_delay = 10; // Initial retry delay in seconds
+    int retry_delay = 10;  // Initial retry delay in seconds
 
     auto& board = Board::GetInstance();
     while (true) {
@@ -481,27 +524,30 @@ void Application::CheckNewVersion() {
             }
 
             char error_message[128];
-            snprintf(error_message, sizeof(error_message), "code=%d, url=%s", err, ota_->GetCheckVersionUrl().c_str());
+            snprintf(error_message, sizeof(error_message), "code=%d, url=%s", err,
+                     ota_->GetCheckVersionUrl().c_str());
             char buffer[256];
-            snprintf(buffer, sizeof(buffer), Lang::Strings::CHECK_NEW_VERSION_FAILED, retry_delay, error_message);
+            snprintf(buffer, sizeof(buffer), Lang::Strings::CHECK_NEW_VERSION_FAILED, retry_delay,
+                     error_message);
             Alert(Lang::Strings::ERROR, buffer, "cloud_slash", Lang::Sounds::OGG_EXCLAMATION);
 
-            ESP_LOGW(TAG, "Check new version failed, retry in %d seconds (%d/%d)", retry_delay, retry_count, MAX_RETRY);
+            ESP_LOGW(TAG, "Check new version failed, retry in %d seconds (%d/%d)", retry_delay,
+                     retry_count, MAX_RETRY);
             for (int i = 0; i < retry_delay; i++) {
                 vTaskDelay(pdMS_TO_TICKS(1000));
                 if (GetDeviceState() == kDeviceStateIdle) {
                     break;
                 }
             }
-            retry_delay *= 2; // Double the retry delay
+            retry_delay *= 2;  // Double the retry delay
             continue;
         }
         retry_count = 0;
-        retry_delay = 10; // Reset retry delay
+        retry_delay = 10;  // Reset retry delay
 
         if (ota_->HasNewVersion()) {
             if (UpgradeFirmware(ota_->GetFirmwareUrl(), ota_->GetFirmwareVersion())) {
-                return; // This line will never be reached after reboot
+                return;  // This line will never be reached after reboot
             }
             // If upgrade failed, continue to normal operation
         }
@@ -553,29 +599,29 @@ void Application::InitializeProtocol() {
         protocol_ = std::make_unique<MqttProtocol>();
     }
 
-    protocol_->OnConnected([this]() {
-        DismissAlert();
-    });
+    protocol_->OnConnected([this]() { DismissAlert(); });
 
     protocol_->OnNetworkError([this](const std::string& message) {
         last_error_message_ = message;
         xEventGroupSetBits(event_group_, MAIN_EVENT_ERROR);
     });
-    
+
     protocol_->OnIncomingAudio([this](std::unique_ptr<AudioStreamPacket> packet) {
         if (GetDeviceState() == kDeviceStateSpeaking) {
             audio_service_.PushPacketToDecodeQueue(std::move(packet));
         }
     });
-    
+
     protocol_->OnAudioChannelOpened([this, codec, &board]() {
         board.SetPowerSaveLevel(PowerSaveLevel::PERFORMANCE);
         if (protocol_->server_sample_rate() != codec->output_sample_rate()) {
-            ESP_LOGW(TAG, "Server sample rate %d does not match device output sample rate %d, resampling may cause distortion",
-                protocol_->server_sample_rate(), codec->output_sample_rate());
+            ESP_LOGW(TAG,
+                     "Server sample rate %d does not match device output sample rate %d, "
+                     "resampling may cause distortion",
+                     protocol_->server_sample_rate(), codec->output_sample_rate());
         }
     });
-    
+
     protocol_->OnAudioChannelClosed([this, &board]() {
         board.SetPowerSaveLevel(PowerSaveLevel::LOW_POWER);
         Schedule([this]() {
@@ -584,7 +630,7 @@ void Application::InitializeProtocol() {
             SetDeviceState(kDeviceStateIdle);
         });
     });
-    
+
     protocol_->OnIncomingJson([this, display](const cJSON* root) {
         // Parse JSON data
         auto type = cJSON_GetObjectItem(root, "type");
@@ -648,9 +694,7 @@ void Application::InitializeProtocol() {
                 ESP_LOGI(TAG, "System command: %s", command->valuestring);
                 if (strcmp(command->valuestring, "reboot") == 0) {
                     // Do a reboot if user requests a OTA update
-                    Schedule([this]() {
-                        Reboot();
-                    });
+                    Schedule([this]() { Reboot(); });
                 } else {
                     ESP_LOGW(TAG, "Unknown system command: %s", command->valuestring);
                 }
@@ -660,7 +704,8 @@ void Application::InitializeProtocol() {
             auto message = cJSON_GetObjectItem(root, "message");
             auto emotion = cJSON_GetObjectItem(root, "emotion");
             if (cJSON_IsString(status) && cJSON_IsString(message) && cJSON_IsString(emotion)) {
-                Alert(status->valuestring, message->valuestring, emotion->valuestring, Lang::Sounds::OGG_VIBRATION);
+                Alert(status->valuestring, message->valuestring, emotion->valuestring,
+                      Lang::Sounds::OGG_VIBRATION);
             } else {
                 ESP_LOGW(TAG, "Alert command requires status, message and emotion");
             }
@@ -669,9 +714,10 @@ void Application::InitializeProtocol() {
             auto payload = cJSON_GetObjectItem(root, "payload");
             ESP_LOGI(TAG, "Received custom message: %s", cJSON_PrintUnformatted(root));
             if (cJSON_IsObject(payload)) {
-                Schedule([this, display, payload_str = std::string(cJSON_PrintUnformatted(payload))]() {
-                    display->SetChatMessage("system", payload_str.c_str());
-                });
+                Schedule(
+                    [this, display, payload_str = std::string(cJSON_PrintUnformatted(payload))]() {
+                        display->SetChatMessage("system", payload_str.c_str());
+                    });
             } else {
                 ESP_LOGW(TAG, "Invalid custom message format: missing payload");
             }
@@ -680,7 +726,7 @@ void Application::InitializeProtocol() {
             ESP_LOGW(TAG, "Unknown message type: %s", type->valuestring);
         }
     });
-    
+
     protocol_->Start();
 }
 
@@ -689,32 +735,27 @@ void Application::ShowActivationCode(const std::string& code, const std::string&
         char digit;
         const std::string_view& sound;
     };
-    static const std::array<digit_sound, 10> digit_sounds{{
-        digit_sound{'0', Lang::Sounds::OGG_0},
-        digit_sound{'1', Lang::Sounds::OGG_1}, 
-        digit_sound{'2', Lang::Sounds::OGG_2},
-        digit_sound{'3', Lang::Sounds::OGG_3},
-        digit_sound{'4', Lang::Sounds::OGG_4},
-        digit_sound{'5', Lang::Sounds::OGG_5},
-        digit_sound{'6', Lang::Sounds::OGG_6},
-        digit_sound{'7', Lang::Sounds::OGG_7},
-        digit_sound{'8', Lang::Sounds::OGG_8},
-        digit_sound{'9', Lang::Sounds::OGG_9}
-    }};
+    static const std::array<digit_sound, 10> digit_sounds{
+        {digit_sound{'0', Lang::Sounds::OGG_0}, digit_sound{'1', Lang::Sounds::OGG_1},
+         digit_sound{'2', Lang::Sounds::OGG_2}, digit_sound{'3', Lang::Sounds::OGG_3},
+         digit_sound{'4', Lang::Sounds::OGG_4}, digit_sound{'5', Lang::Sounds::OGG_5},
+         digit_sound{'6', Lang::Sounds::OGG_6}, digit_sound{'7', Lang::Sounds::OGG_7},
+         digit_sound{'8', Lang::Sounds::OGG_8}, digit_sound{'9', Lang::Sounds::OGG_9}}};
 
     // This sentence uses 9KB of SRAM, so we need to wait for it to finish
     Alert(Lang::Strings::ACTIVATION, message.c_str(), "link", Lang::Sounds::OGG_ACTIVATION);
 
     for (const auto& digit : code) {
         auto it = std::find_if(digit_sounds.begin(), digit_sounds.end(),
-            [digit](const digit_sound& ds) { return ds.digit == digit; });
+                               [digit](const digit_sound& ds) { return ds.digit == digit; });
         if (it != digit_sounds.end()) {
             audio_service_.PlaySound(it->sound);
         }
     }
 }
 
-void Application::Alert(const char* status, const char* message, const char* emotion, const std::string_view& sound) {
+void Application::Alert(const char* status, const char* message, const char* emotion,
+                        const std::string_view& sound) {
     ESP_LOGW(TAG, "Alert [%s] %s: %s", emotion, status, message);
     auto display = Board::GetInstance().GetDisplay();
     display->SetStatus(status);
@@ -734,21 +775,15 @@ void Application::DismissAlert() {
     }
 }
 
-void Application::ToggleChatState() {
-    xEventGroupSetBits(event_group_, MAIN_EVENT_TOGGLE_CHAT);
-}
+void Application::ToggleChatState() { xEventGroupSetBits(event_group_, MAIN_EVENT_TOGGLE_CHAT); }
 
-void Application::StartListening() {
-    xEventGroupSetBits(event_group_, MAIN_EVENT_START_LISTENING);
-}
+void Application::StartListening() { xEventGroupSetBits(event_group_, MAIN_EVENT_START_LISTENING); }
 
-void Application::StopListening() {
-    xEventGroupSetBits(event_group_, MAIN_EVENT_STOP_LISTENING);
-}
+void Application::StopListening() { xEventGroupSetBits(event_group_, MAIN_EVENT_STOP_LISTENING); }
 
 void Application::HandleToggleChatEvent() {
     auto state = GetDeviceState();
-    
+
     if (state == kDeviceStateActivating) {
         SetDeviceState(kDeviceStateIdle);
         return;
@@ -772,9 +807,7 @@ void Application::HandleToggleChatEvent() {
         if (!protocol_->IsAudioChannelOpened()) {
             SetDeviceState(kDeviceStateConnecting);
             // Schedule to let the state change be processed first (UI update)
-            Schedule([this, mode]() {
-                ContinueOpenAudioChannel(mode);
-            });
+            Schedule([this, mode]() { ContinueOpenAudioChannel(mode); });
             return;
         }
         SetListeningMode(mode);
@@ -802,7 +835,7 @@ void Application::ContinueOpenAudioChannel(ListeningMode mode) {
 
 void Application::HandleStartListeningEvent() {
     auto state = GetDeviceState();
-    
+
     if (state == kDeviceStateActivating) {
         SetDeviceState(kDeviceStateIdle);
         return;
@@ -816,14 +849,12 @@ void Application::HandleStartListeningEvent() {
         ESP_LOGE(TAG, "Protocol not initialized");
         return;
     }
-    
+
     if (state == kDeviceStateIdle) {
         if (!protocol_->IsAudioChannelOpened()) {
             SetDeviceState(kDeviceStateConnecting);
             // Schedule to let the state change be processed first (UI update)
-            Schedule([this]() {
-                ContinueOpenAudioChannel(kListeningModeManualStop);
-            });
+            Schedule([this]() { ContinueOpenAudioChannel(kListeningModeManualStop); });
             return;
         }
         SetListeningMode(kListeningModeManualStop);
@@ -835,7 +866,7 @@ void Application::HandleStartListeningEvent() {
 
 void Application::HandleStopListeningEvent() {
     auto state = GetDeviceState();
-    
+
     if (state == kDeviceStateAudioTesting) {
         audio_service_.EnableAudioTesting(false);
         SetDeviceState(kDeviceStateWifiConfiguring);
@@ -865,9 +896,7 @@ void Application::HandleWakeWordDetectedEvent() {
             SetDeviceState(kDeviceStateConnecting);
             // Schedule to let the state change be processed first (UI update),
             // then continue with OpenAudioChannel which may block for ~1 second
-            Schedule([this, wake_word]() {
-                ContinueWakeWordInvoke(wake_word);
-            });
+            Schedule([this, wake_word]() { ContinueWakeWordInvoke(wake_word); });
             return;
         }
         // Channel already opened, continue directly
@@ -875,7 +904,8 @@ void Application::HandleWakeWordDetectedEvent() {
     } else if (state == kDeviceStateSpeaking || state == kDeviceStateListening) {
         AbortSpeaking(kAbortReasonWakeWordDetected);
         // Clear send queue to avoid sending residues to server
-        while (audio_service_.PopPacketFromSendQueue());
+        while (audio_service_.PopPacketFromSendQueue())
+            ;
 
         if (state == kDeviceStateListening) {
             protocol_->SendStartListening(GetDefaultListeningMode());
@@ -932,13 +962,13 @@ void Application::HandleStateChangedEvent() {
     auto display = board.GetDisplay();
     auto led = board.GetLed();
     led->OnStateChanged();
-    
+
     switch (new_state) {
         case kDeviceStateUnknown:
         case kDeviceStateIdle:
             display->SetStatus(Lang::Strings::STANDBY);
-            display->ClearChatMessages();  // Clear messages first
-            display->SetEmotion("neutral"); // Then set emotion (wechat mode checks child count)
+            display->ClearChatMessages();    // Clear messages first
+            display->SetEmotion("neutral");  // Then set emotion (wechat mode checks child count)
             audio_service_.EnableVoiceProcessing(false);
             audio_service_.EnableWakeWordDetection(true);
             break;
@@ -953,12 +983,13 @@ void Application::HandleStateChangedEvent() {
 
             // Make sure the audio processor is running
             if (play_popup_on_listening_ || !audio_service_.IsAudioProcessorRunning()) {
-                // For auto mode, wait for playback queue to be empty before enabling voice processing
-                // This prevents audio truncation when STOP arrives late due to network jitter
+                // For auto mode, wait for playback queue to be empty before enabling voice
+                // processing This prevents audio truncation when STOP arrives late due to network
+                // jitter
                 if (listening_mode_ == kListeningModeAutoStop) {
                     audio_service_.WaitForPlaybackQueueEmpty();
                 }
-                
+
                 // Send the start listening command
                 protocol_->SendStartListening(listening_mode_);
                 audio_service_.EnableVoiceProcessing(true);
@@ -971,7 +1002,7 @@ void Application::HandleStateChangedEvent() {
             // Disable wake word detection in listening mode
             audio_service_.EnableWakeWordDetection(false);
 #endif
-            
+
             // Play popup sound after ResetDecoder (in EnableVoiceProcessing) has been called
             if (play_popup_on_listening_) {
                 play_popup_on_listening_ = false;
@@ -1050,7 +1081,8 @@ bool Application::UpgradeFirmware(const std::string& url, const std::string& ver
     }
     ESP_LOGI(TAG, "Starting firmware upgrade from URL: %s", upgrade_url.c_str());
 
-    Alert(Lang::Strings::OTA_UPGRADE, Lang::Strings::UPGRADING, "download", Lang::Sounds::OGG_UPGRADE);
+    Alert(Lang::Strings::OTA_UPGRADE, Lang::Strings::UPGRADING, "download",
+          Lang::Sounds::OGG_UPGRADE);
     vTaskDelay(pdMS_TO_TICKS(3000));
 
     SetDeviceState(kDeviceStateUpgrading);
@@ -1072,17 +1104,19 @@ bool Application::UpgradeFirmware(const std::string& url, const std::string& ver
 
     if (!upgrade_success) {
         // Upgrade failed, restart audio service and continue running
-        ESP_LOGE(TAG, "Firmware upgrade failed, restarting audio service and continuing operation...");
-        audio_service_.Start(); // Restart audio service
-        board.SetPowerSaveLevel(PowerSaveLevel::LOW_POWER); // Restore power save level
-        Alert(Lang::Strings::ERROR, Lang::Strings::UPGRADE_FAILED, "circle_xmark", Lang::Sounds::OGG_EXCLAMATION);
+        ESP_LOGE(TAG,
+                 "Firmware upgrade failed, restarting audio service and continuing operation...");
+        audio_service_.Start();                              // Restart audio service
+        board.SetPowerSaveLevel(PowerSaveLevel::LOW_POWER);  // Restore power save level
+        Alert(Lang::Strings::ERROR, Lang::Strings::UPGRADE_FAILED, "circle_xmark",
+              Lang::Sounds::OGG_EXCLAMATION);
         vTaskDelay(pdMS_TO_TICKS(3000));
         return false;
     } else {
         // Upgrade success, reboot immediately
         ESP_LOGI(TAG, "Firmware upgrade successful, rebooting...");
         display->SetChatMessage("system", "Upgrade successful, rebooting...");
-        vTaskDelay(pdMS_TO_TICKS(1000)); // Brief pause to show message
+        vTaskDelay(pdMS_TO_TICKS(1000));  // Brief pause to show message
         Reboot();
         return true;
     }
@@ -1094,25 +1128,21 @@ void Application::WakeWordInvoke(const std::string& wake_word) {
     }
 
     auto state = GetDeviceState();
-    
+
     if (state == kDeviceStateIdle) {
         audio_service_.EncodeWakeWord();
 
         if (!protocol_->IsAudioChannelOpened()) {
             SetDeviceState(kDeviceStateConnecting);
             // Schedule to let the state change be processed first (UI update)
-            Schedule([this, wake_word]() {
-                ContinueWakeWordInvoke(wake_word);
-            });
+            Schedule([this, wake_word]() { ContinueWakeWordInvoke(wake_word); });
             return;
         }
         // Channel already opened, continue directly
         ContinueWakeWordInvoke(wake_word);
     } else if (state == kDeviceStateSpeaking) {
-        Schedule([this]() {
-            AbortSpeaking(kAbortReasonNone);
-        });
-    } else if (state == kDeviceStateListening) {   
+        Schedule([this]() { AbortSpeaking(kAbortReasonNone); });
+    } else if (state == kDeviceStateListening) {
         Schedule([this]() {
             if (protocol_) {
                 protocol_->CloseAudioChannel();
@@ -1153,18 +1183,18 @@ void Application::SetAecMode(AecMode mode) {
         auto& board = Board::GetInstance();
         auto display = board.GetDisplay();
         switch (aec_mode_) {
-        case kAecOff:
-            audio_service_.EnableDeviceAec(false);
-            display->ShowNotification(Lang::Strings::RTC_MODE_OFF);
-            break;
-        case kAecOnServerSide:
-            audio_service_.EnableDeviceAec(false);
-            display->ShowNotification(Lang::Strings::RTC_MODE_ON);
-            break;
-        case kAecOnDeviceSide:
-            audio_service_.EnableDeviceAec(true);
-            display->ShowNotification(Lang::Strings::RTC_MODE_ON);
-            break;
+            case kAecOff:
+                audio_service_.EnableDeviceAec(false);
+                display->ShowNotification(Lang::Strings::RTC_MODE_OFF);
+                break;
+            case kAecOnServerSide:
+                audio_service_.EnableDeviceAec(false);
+                display->ShowNotification(Lang::Strings::RTC_MODE_ON);
+                break;
+            case kAecOnDeviceSide:
+                audio_service_.EnableDeviceAec(true);
+                display->ShowNotification(Lang::Strings::RTC_MODE_ON);
+                break;
         }
 
         // If the AEC mode is changed, close the audio channel
@@ -1174,9 +1204,7 @@ void Application::SetAecMode(AecMode mode) {
     });
 }
 
-void Application::PlaySound(const std::string_view& sound) {
-    audio_service_.PlaySound(sound);
-}
+void Application::PlaySound(const std::string_view& sound) { audio_service_.PlaySound(sound); }
 
 void Application::ResetProtocol() {
     Schedule([this]() {
@@ -1188,4 +1216,3 @@ void Application::ResetProtocol() {
         protocol_.reset();
     });
 }
-

@@ -291,6 +291,13 @@ public:
     virtual Camera* GetCamera() override {
         return camera_;
     }
+    
+    // 添加获取I2C总线的方法
+    i2c_master_bus_handle_t GetI2cBus() const {
+        return i2c_bus_;
+    }
+
+public:
 };
 
 DECLARE_BOARD(LichuangDevBoard);

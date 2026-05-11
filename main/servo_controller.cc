@@ -10,7 +10,11 @@
 static const char* TAG = "ServoController";
 
 ServoController::ServoController()
-    : i2c_bus_(nullptr), pca9685_handle_(nullptr), initialized_(false) {}
+    : i2c_bus_(nullptr), 
+      pca9685_handle_(nullptr), 
+      initialized_(false),
+      last_command_(""),  // 【新增】初始化上次命令为空
+      last_command_time_(std::chrono::steady_clock::now()) {}  // 【新增】初始化时间为当前时间
 
 ServoController::~ServoController() {
     if (pca9685_handle_ != nullptr) {
@@ -43,51 +47,71 @@ esp_err_t ServoController::Initialize(i2c_master_bus_handle_t i2c_bus) {
         return err;
     }
 
-    // 初始化PCA9685
-    err = WriteRegister(kMode2, 0x04);  // OUTDRV
-    if (err != ESP_OK) {
-        ESP_LOGE(TAG, "PCA9685 mode2 init failed: %s", esp_err_to_name(err));
-        return err;
-    }
-
-    err = WriteRegister(kMode1, 0x00);
-    if (err != ESP_OK) {
-        ESP_LOGE(TAG, "PCA9685 mode1 init failed: %s", esp_err_to_name(err));
-        return err;
-    }
-
-    vTaskDelay(pdMS_TO_TICKS(10));
-
-    err = WriteRegister(kMode1, 0x10);  // sleep
+    // 【关键】1. 进入睡眠模式以设置频率（与Arduino代码完全一致）
+    err = WriteRegister(kMode1, 0x10); // SLEEP=1
     if (err != ESP_OK) {
         ESP_LOGE(TAG, "PCA9685 enter sleep failed: %s", esp_err_to_name(err));
         return err;
     }
-
-    // 设置PWM频率
+    vTaskDelay(pdMS_TO_TICKS(10));
+    ESP_LOGI(TAG, "✅ PCA9685进入睡眠模式");
+    
+    // 2. 设置预分频器 (Prescale) for 50Hz
     int prescale = static_cast<int>(round((kOscillatorHz / (4096.0 * kPwmFreqHz)) - 1));
+    ESP_LOGI(TAG, "Setting Prescale to %d for %d Hz", prescale, kPwmFreqHz);
     err = WriteRegister(kPrescale, static_cast<uint8_t>(prescale));
+    if (err != ESP_OK) return err;
+    vTaskDelay(pdMS_TO_TICKS(10));
+    
+    // 3. 唤醒芯片（退出睡眠模式）
+    err = WriteRegister(kMode1, 0x00); // SLEEP=0
+    if (err != ESP_OK) return err;
+    vTaskDelay(pdMS_TO_TICKS(10));
+    ESP_LOGI(TAG, "✅ PCA9685唤醒成功");
+    
+    // 【关键】4. 设置Mode2为推挽输出模式（与Arduino代码完全一致）
+    err = WriteRegister(kMode2, 0x04); // OUTDRV=1 (推挽输出)
     if (err != ESP_OK) {
-        ESP_LOGE(TAG, "PCA9685 prescale set failed: %s", esp_err_to_name(err));
+        ESP_LOGE(TAG, "PCA9685 Mode2 set failed: %s", esp_err_to_name(err));
         return err;
     }
-
-    err = WriteRegister(kMode1, 0x00);
-    if (err != ESP_OK) {
-        ESP_LOGE(TAG, "PCA9685 wake failed: %s", esp_err_to_name(err));
-        return err;
+    ESP_LOGI(TAG, "✅ PCA9685 Mode2设置为推挽输出模式 (0x04)");
+    
+    // 5. 清零所有通道的PWM值
+    for (int ch = 0; ch < 16; ++ch) {
+        WritePwm(ch, 0, 0);
     }
-
     vTaskDelay(pdMS_TO_TICKS(10));
 
-    err = WriteRegister(kMode1, 0x80);  // restart
-    if (err != ESP_OK) {
-        ESP_LOGE(TAG, "PCA9685 restart failed: %s", esp_err_to_name(err));
-        return err;
-    }
-
     initialized_ = true;
-    ESP_LOGI(TAG, "ServoController initialized successfully");
+    
+    // 🔍 I2C通信验证测试
+    ESP_LOGI("SERVO_DEBUG", "🔍 PCA9685初始化完成，开始验证...");
+    
+    // 读取Mode1和Mode2寄存器验证配置
+    uint8_t mode1_value = 0, mode2_value = 0;
+    
+    // 先写入要读取的寄存器地址
+    uint8_t reg_addr = kMode1;
+    esp_err_t read_err = i2c_master_transmit_receive(pca9685_handle_, &reg_addr, 1, &mode1_value, 1, 100);
+    if (read_err == ESP_OK) {
+        ESP_LOGI("SERVO_DEBUG", "✅ Mode1=0x%02X (应为0x00)", mode1_value);
+    } else {
+        ESP_LOGE("SERVO_DEBUG", "❌ 读取Mode1失败: %s", esp_err_to_name(read_err));
+    }
+    
+    reg_addr = kMode2;
+    read_err = i2c_master_transmit_receive(pca9685_handle_, &reg_addr, 1, &mode2_value, 1, 100);
+    if (read_err == ESP_OK) {
+        ESP_LOGI("SERVO_DEBUG", "✅ Mode2=0x%02X (应为0x04推挽输出)", mode2_value);
+        if (mode2_value != 0x04) {
+            ESP_LOGW("SERVO_DEBUG", "⚠️ Mode2值不正确！这是舵机不动作的主要原因");
+        }
+    } else {
+        ESP_LOGE("SERVO_DEBUG", "❌ 读取Mode2失败: %s", esp_err_to_name(read_err));
+    }
+    
+    ESP_LOGI(TAG, "Servo controller initialized successfully");
     return ESP_OK;
 }
 
@@ -123,53 +147,36 @@ void ServoController::AddServo(const ServoConfig& config) {
     }
     current_angles_[config.channel] = config.default_angle;
 
-    // 如果已初始化，设置到默认角度
-    if (initialized_) {
-        SetAngle(config.channel, config.default_angle);
-    }
+    // 【修改】不再在初始化时自动设置舵机角度，等待语音控制
+    // if (initialized_) {
+    //     SetAngle(config.channel, config.default_angle);
+    // }
 
-    ESP_LOGI(TAG, "Added servo: channel=%d, name=%s, default_angle=%d", config.channel,
+    ESP_LOGI(TAG, "Added servo: channel=%d, name=%s, default_angle=%d (待语音控制)", config.channel,
              config.name.c_str(), config.default_angle);
 }
 
 esp_err_t ServoController::SetAngle(uint8_t channel, int angle) {
-    if (!initialized_) {
-        ESP_LOGE(TAG, "ServoController not initialized");
+    if (!initialized_ || channel >= servos_.size()) {
+        ESP_LOGE("SERVO_DEBUG", "❌ SetAngle失败: initialized=%d, channel=%d, servos_size=%zu", 
+                 initialized_, channel, servos_.size());
         return ESP_ERR_INVALID_STATE;
     }
 
-    if (channel >= servos_.size() || channel >= 16) {
-        ESP_LOGE(TAG, "Invalid servo channel: %d", channel);
-        return ESP_ERR_INVALID_ARG;
-    }
+    const auto& config = servos_[channel];
+    int pwm_value = AngleToPwmValue(config, angle);
+    
+    ESP_LOGI("SERVO_DEBUG", "📊 SetAngle计算结果: channel=%d, angle=%d, pwm_value=%d", 
+             channel, angle, pwm_value);
 
-    // 找到对应的舵机配置
-    const ServoConfig* config = nullptr;
-    for (const auto& servo : servos_) {
-        if (servo.channel == channel) {
-            config = &servo;
-            break;
-        }
-    }
-
-    if (!config) {
-        ESP_LOGE(TAG, "No configuration found for channel %d", channel);
-        return ESP_ERR_NOT_FOUND;
-    }
-
-    // 限制角度范围
-    angle = std::max(config->min_angle, std::min(config->max_angle, angle));
-
-    int off = AngleToPwmValue(*config, angle);
-    esp_err_t err = WritePwm(channel, 0, off);
+    esp_err_t err = WritePwm(channel, 0, pwm_value);
     if (err == ESP_OK) {
         current_angles_[channel] = angle;
-        ESP_LOGD(TAG, "Set servo channel %d to angle %d", channel, angle);
+        ESP_LOGI("SERVO_DEBUG", "✅ PWM写入成功: ON=0, OFF=%d", pwm_value);
     } else {
-        ESP_LOGE(TAG, "Failed to set servo channel %d to angle %d: %s", channel, angle,
-                 esp_err_to_name(err));
+        ESP_LOGE("SERVO_DEBUG", "❌ PWM写入失败! 错误码: %s (0x%X)", esp_err_to_name(err), err);
     }
-
+    
     return err;
 }
 
@@ -198,24 +205,6 @@ int ServoController::GetCurrentAngleByName(const std::string& name) const {
     return current_angles_[servos_[index].channel];
 }
 
-// bool ServoController::ProcessVoiceCommand(const std::string& text) {
-//     std::string servo_name;
-//     int angle;
-
-//     // 👇 新增调试日志，必加！
-//     ESP_LOGI("SERVO_DEBUG", "收到语音指令：%s", text.c_str());
-
-//     if (!ParseVoiceCommand(text, servo_name, angle)) {
-//         // 👇 解析失败时打印，立刻就能看到问题
-//         ESP_LOGW("SERVO_DEBUG", "❌ 指令解析失败！servo_name: %s, angle: %d", servo_name.c_str(),
-//         angle); return false;
-//     }
-
-//     ESP_LOGI("SERVO_DEBUG", "✅ 解析成功！舵机名：%s，目标角度：%d", servo_name.c_str(), angle);
-
-//     // 后面的代码保持不变...
-// }
-
 bool ServoController::ProcessVoiceCommand(const std::string& text) {
     std::string servo_name;
     int angle;
@@ -223,31 +212,95 @@ bool ServoController::ProcessVoiceCommand(const std::string& text) {
     // 👇 新增调试日志，必加！
     ESP_LOGI("SERVO_DEBUG", "收到语音指令：%s", text.c_str());
 
-    if (!ParseVoiceCommand(text, servo_name, angle)) {
-        // 👇 解析失败时打印，立刻就能看到问题
-        ESP_LOGW("SERVO_DEBUG", "❌ 指令解析失败！servo_name: %s, angle: %d", servo_name.c_str(),
+    // 【新增】指令去重和时间间隔检查
+    auto now = std::chrono::steady_clock::now();
+    auto elapsed_ms = std::chrono::duration_cast<std::chrono::milliseconds>(
+        now - last_command_time_).count();
+    
+    // 如果命令相同且时间间隔小于阈值，忽略该命令
+    if (text == last_command_ && elapsed_ms < kMinCommandIntervalMs) {
+        ESP_LOGW("SERVO_DEBUG", "⚠️ 忽略重复命令（%dms内）", static_cast<int>(elapsed_ms));
         return false;
     }
 
+    if (!ParseVoiceCommand(text, servo_name, angle)) {
+        // 👇 解析失败时打印，立刻就能看到问题
+        ESP_LOGW("SERVO_DEBUG", "❌ 指令解析失败！servo_name: %s, angle: %d", servo_name.c_str(),
+                 angle); return false;
+    }
+
     ESP_LOGI("SERVO_DEBUG", "✅ 解析成功！舵机名：%s，目标角度：%d", servo_name.c_str(), angle);
-    
+
     esp_err_t err;
+    
+    // 【新增】处理停止命令
+    if (angle == -1) {
+        ESP_LOGI("SERVO_DEBUG", "🛑 执行停止命令，关闭PWM输出");
+        
+        uint8_t target_channel;
+        if (!servo_name.empty()) {
+            int index = FindServoByName(servo_name);
+            if (index < 0) {
+                ESP_LOGE("SERVO_DEBUG", "❌ 未找到名为 '%s' 的舵机", servo_name.c_str());
+                return false;
+            }
+            target_channel = servos_[index].channel;
+        } else {
+            if (servos_.empty()) {
+                ESP_LOGE("SERVO_DEBUG", "❌ 错误：没有注册任何舵机配置！");
+                return false;
+            }
+            target_channel = servos_[0].channel;
+        }
+        
+        // 将PWM设置为0，停止舵机输出
+        err = WritePwm(target_channel, 0, 0);
+        if (err != ESP_OK) {
+            ESP_LOGE("SERVO_DEBUG", "❌ 停止舵机失败！错误码: %s (0x%X)", esp_err_to_name(err), err);
+            return false;
+        }
+        
+        ESP_LOGI("SERVO_DEBUG", "✅ 舵机已停止！通道: %d", target_channel);
+        
+        if (voice_callback_) {
+            voice_callback_(text, 0);
+        }
+        
+        return true;
+    }
+    
+    // 正常的角度控制逻辑
     if (!servo_name.empty()) {
+        ESP_LOGI("SERVO_DEBUG", "尝试按名称设置舵机角度: %s -> %d度", servo_name.c_str(), angle);
         err = SetAngleByName(servo_name, angle);
     } else {
         // 如果没有指定舵机名称，默认控制第一个舵机
         if (!servos_.empty()) {
+            ESP_LOGI("SERVO_DEBUG", "使用默认舵机通道 %d，设置角度 %d度", servos_[0].channel, angle);
             err = SetAngle(servos_[0].channel, angle);
         } else {
+            ESP_LOGE("SERVO_DEBUG", "❌ 错误：没有注册任何舵机配置！");
             return false;
         }
     }
 
-    if (err == ESP_OK && voice_callback_) {
+    if (err != ESP_OK) {
+        ESP_LOGE("SERVO_DEBUG", "❌ 舵机控制失败！错误码: %s (0x%X)", esp_err_to_name(err), err);
+        return false;
+    }
+
+    ESP_LOGI("SERVO_DEBUG", "✅ 舵机控制成功！");
+
+    // 【新增】更新去重相关变量
+    last_command_ = text;
+    last_command_time_ = std::chrono::steady_clock::now();
+    ESP_LOGD("SERVO_DEBUG", "📝 已记录命令和时间戳，下次相同命令需在%dms后执行", kMinCommandIntervalMs);
+
+    if (voice_callback_) {
         voice_callback_(text, angle);
     }
 
-    return err == ESP_OK;
+    return true;
 }
 
 void ServoController::SetVoiceCommandCallback(VoiceCommandCallback callback) {
@@ -271,14 +324,52 @@ esp_err_t ServoController::WriteRegister(uint8_t reg, uint8_t value) {
 
 esp_err_t ServoController::WritePwm(uint8_t channel, int on, int off) {
     if (pca9685_handle_ == nullptr) {
+        ESP_LOGE("SERVO_DEBUG", "❌ WritePwm失败: pca9685_handle_为空");
         return ESP_ERR_INVALID_STATE;
     }
 
-    int reg = kPwmBase + 4 * channel;
-    uint8_t buffer[5] = {static_cast<uint8_t>(reg), static_cast<uint8_t>(on & 0xFF),
-                         static_cast<uint8_t>((on >> 8) & 0x0F), static_cast<uint8_t>(off & 0xFF),
-                         static_cast<uint8_t>((off >> 8) & 0x0F)};
-    return i2c_master_transmit(pca9685_handle_, buffer, 5, 100);
+    // 【关键修复】按照Arduino方式，分4次单独写入寄存器
+    int base_reg = kPwmBase + 4 * channel;
+    
+    ESP_LOGI("SERVO_DEBUG", "📝 开始写入PWM寄存器: channel=%d, base_reg=0x%02X, ON=%d, OFF=%d", 
+             channel, base_reg, on, off);
+    
+    esp_err_t err;
+    
+    // 写入ON_L
+    err = WriteRegister(base_reg, static_cast<uint8_t>(on & 0xFF));
+    if (err != ESP_OK) {
+        ESP_LOGE("SERVO_DEBUG", "❌ 写入ON_L失败: reg=0x%02X, err=%s", base_reg, esp_err_to_name(err));
+        return err;
+    }
+    ESP_LOGD("SERVO_DEBUG", "✅ ON_L写入成功: 0x%02X", on & 0xFF);
+    
+    // 写入ON_H
+    err = WriteRegister(base_reg + 1, static_cast<uint8_t>((on >> 8) & 0x0F));
+    if (err != ESP_OK) {
+        ESP_LOGE("SERVO_DEBUG", "❌ 写入ON_H失败: reg=0x%02X, err=%s", base_reg + 1, esp_err_to_name(err));
+        return err;
+    }
+    ESP_LOGD("SERVO_DEBUG", "✅ ON_H写入成功: 0x%02X", (on >> 8) & 0x0F);
+    
+    // 写入OFF_L
+    err = WriteRegister(base_reg + 2, static_cast<uint8_t>(off & 0xFF));
+    if (err != ESP_OK) {
+        ESP_LOGE("SERVO_DEBUG", "❌ 写入OFF_L失败: reg=0x%02X, err=%s", base_reg + 2, esp_err_to_name(err));
+        return err;
+    }
+    ESP_LOGD("SERVO_DEBUG", "✅ OFF_L写入成功: 0x%02X", off & 0xFF);
+    
+    // 写入OFF_H
+    err = WriteRegister(base_reg + 3, static_cast<uint8_t>((off >> 8) & 0x0F));
+    if (err != ESP_OK) {
+        ESP_LOGE("SERVO_DEBUG", "❌ 写入OFF_H失败: reg=0x%02X, err=%s", base_reg + 3, esp_err_to_name(err));
+        return err;
+    }
+    ESP_LOGD("SERVO_DEBUG", "✅ OFF_H写入成功: 0x%02X", (off >> 8) & 0x0F);
+    
+    ESP_LOGI("SERVO_DEBUG", "✅ PWM寄存器全部写入成功");
+    return ESP_OK;
 }
 
 int ServoController::AngleToPwmValue(const ServoConfig& config, int angle) const {
@@ -307,6 +398,14 @@ bool ServoController::ParseVoiceCommand(const std::string& text, std::string& se
 
     // 检查是否包含舵机相关关键词
     if (normalized.find("舵机") == std::string::npos &&
+        normalized.find("舵积") == std::string::npos &&
+        normalized.find("舵汁") == std::string::npos &&
+        normalized.find("剁机") == std::string::npos &&
+        normalized.find("剁汁") == std::string::npos &&
+        normalized.find("多机") == std::string::npos &&
+        normalized.find("舵鸡") == std::string::npos &&
+        normalized.find("舵记") == std::string::npos &&
+        normalized.find("舵极") == std::string::npos &&
         normalized.find("duoji") == std::string::npos &&
         normalized.find("servo") == std::string::npos) {
         return false;
@@ -336,7 +435,15 @@ bool ServoController::ParseVoiceCommand(const std::string& text, std::string& se
 
     // 如果没找到具体角度，检查预设命令
     if (angle < 0) {
-        if (normalized.find("归位") != std::string::npos ||
+        // 【新增】检查是否为停止命令
+        if (normalized.find("停止") != std::string::npos ||
+            normalized.find("停") != std::string::npos ||
+            normalized.find("stop") != std::string::npos ||
+            normalized.find("halt") != std::string::npos) {
+            angle = -1;  // 使用-1作为停止标志
+            ESP_LOGI("SERVO_DEBUG", "🛑 检测到停止命令");
+        }
+        else if (normalized.find("归位") != std::string::npos ||
             normalized.find("复位") != std::string::npos ||
             normalized.find("中") != std::string::npos ||
             normalized.find("中间") != std::string::npos) {
